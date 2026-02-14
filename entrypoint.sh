@@ -57,7 +57,7 @@ chown -R opensips:opensips /etc/opensips
 # Start OpenSIPS in foreground
 # ---------------------------------------------------------------------------
 echo "[entrypoint] Starting OpenSIPS..."
-exec opensips -FE \
+exec opensips -F \
     -m "$SHM_MEMORY" \
     -M "$PKG_MEMORY" \
     -f /etc/opensips/opensips.cfg

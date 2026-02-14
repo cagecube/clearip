@@ -21,21 +21,22 @@ dns = no
 rev_dns = no
 
 # ───────────────────────────────────────────────────────────────
-# Listen directives — dual interface
+# Socket directives — dual interface
 # ───────────────────────────────────────────────────────────────
 
 # LAN side — PBX and phones
-listen = udp:${INTERNAL_IP}:${INTERNAL_PORT}   as lan
-listen = tcp:${INTERNAL_IP}:${INTERNAL_PORT}   as lan
+socket = udp:${INTERNAL_IP}:${INTERNAL_PORT}
+socket = tcp:${INTERNAL_IP}:${INTERNAL_PORT}
 
 # WAN side — SIP trunks / ITSP
-listen = udp:${EXTERNAL_IP}:${EXTERNAL_PORT}   as wan
-listen = tcp:${EXTERNAL_IP}:${EXTERNAL_PORT}   as wan
-listen = tls:${EXTERNAL_IP}:${EXTERNAL_TLS_PORT} as wan
+socket = udp:${EXTERNAL_IP}:${EXTERNAL_PORT}
+socket = tcp:${EXTERNAL_IP}:${EXTERNAL_PORT}
+socket = tls:${EXTERNAL_IP}:${EXTERNAL_TLS_PORT}
 
 # ───────────────────────────────────────────────────────────────
 # Modules
 # ───────────────────────────────────────────────────────────────
+mpath = "/usr/lib/x86_64-linux-gnu/opensips/modules"
 loadmodule "signaling.so"
 loadmodule "sl.so"
 loadmodule "tm.so"
@@ -43,7 +44,6 @@ loadmodule "rr.so"
 loadmodule "maxfwd.so"
 loadmodule "textops.so"
 loadmodule "sipmsgops.so"
-loadmodule "uri.so"
 loadmodule "nathelper.so"
 loadmodule "tls_openssl.so"
 loadmodule "tls_mgm.so"
@@ -61,16 +61,13 @@ modparam("tm", "fr_timeout", 5)
 modparam("tm", "fr_inv_timeout", 30)
 
 # -- Record-Route --
-modparam("rr", "enable_full_lr", 1)
 modparam("rr", "append_fromtag", 1)
 
 # -- NAT Helper --
-modparam("nathelper", "natping_interval", 30)
 modparam("nathelper", "received_avp", "$avp(received)")
 
 # -- TLS --
 modparam("tls_mgm", "server_domain", "default")
-modparam("tls_mgm", "match", "[default]*")
 modparam("tls_mgm", "certificate", "[default]/etc/opensips/tls/cert.pem")
 modparam("tls_mgm", "private_key", "[default]/etc/opensips/tls/ckey.pem")
 modparam("tls_mgm", "verify_cert",  "[default]0")
@@ -92,12 +89,8 @@ route {
     }
 
     # ── Determine which interface the request arrived on ──
-    if (is_myself("$si")) {
-        # Shouldn't happen — skip
-    }
-
-    # Tag the source interface
-    if ($socket_in(name) == "lan") {
+    # Compare receiving socket IP against our known internal IP
+    if ($socket_in(ip) == "${INTERNAL_IP}") {
         $avp(source) = "lan";
         xlog("L_INFO", "[$ci] Inbound from LAN ($si:$sp) — $rm $ru\n");
     } else {
@@ -135,10 +128,10 @@ route {
 
     # ── NAT detection for WAN-side traffic ──
     if ($avp(source) == "wan") {
-        if (nat_uac_test(19)) {
+        if (nat_uac_test("private-contact,diff-ip-src-via,diff-port-src-via")) {
             fix_nated_contact();
             force_rport();
-            setflag(6);   # NAT flag
+            setflag("NAT");
         }
     }
 
@@ -168,7 +161,7 @@ route[TO_WAN] {
 
     # Force outbound via WAN interface
     $du = "sip:${EXTERNAL_IP}:${EXTERNAL_PORT}";
-    $fs = "udp:${EXTERNAL_IP}:${EXTERNAL_PORT}";
+    $socket_out = "udp:${EXTERNAL_IP}:${EXTERNAL_PORT}";
 
     # Relay to trunk — adjust $du to your ITSP/trunk IP as needed
     # For production, replace the $du above with your trunk destination:
@@ -192,7 +185,7 @@ route[TO_LAN] {
     # route(CLEARIP_VERIFY);
 
     # Force inbound to LAN interface toward PBX
-    $fs = "udp:${INTERNAL_IP}:${INTERNAL_PORT}";
+    $socket_out = "udp:${INTERNAL_IP}:${INTERNAL_PORT}";
 
     # Route to your PBX — set this to your PBX IP:
     # $du = "sip:<PBX_IP>:5060";
@@ -212,7 +205,7 @@ route[CLEARIP_SIGN] {
 
     $var(clearip_req) = '{"from":"' + $fU + '","to":"' + $tU + '"}';
 
-    if (rest_post("${CLEARIP_URL}/sign", "$var(clearip_req)", "application/json", "$var(body)", "$var(ct)", "$var(rcode)")) {
+    if (rest_post("${CLEARIP_URL}/sign", "$var(clearip_req)", "application/json", $var(body), $var(ct), $var(rcode))) {
         if ($var(rcode) == 200) {
             xlog("L_INFO", "[$ci] ClearIP: Signed successfully\n");
             # Append Identity header from ClearIP response
@@ -234,7 +227,7 @@ route[CLEARIP_VERIFY] {
 
     $var(clearip_req) = '{"from":"' + $fU + '","to":"' + $tU + '"}';
 
-    if (rest_post("${CLEARIP_URL}/verify", "$var(clearip_req)", "application/json", "$var(body)", "$var(ct)", "$var(rcode)")) {
+    if (rest_post("${CLEARIP_URL}/verify", "$var(clearip_req)", "application/json", $var(body), $var(ct), $var(rcode))) {
         if ($var(rcode) == 200) {
             xlog("L_INFO", "[$ci] ClearIP: Verification passed\n");
         } else {
