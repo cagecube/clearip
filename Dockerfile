@@ -22,17 +22,16 @@ RUN curl -fsSL https://apt.opensips.org/opensips-org.gpg | gpg --dearmor -o /usr
     && echo "deb [signed-by=/usr/share/keyrings/opensips-archive-keyring.gpg] https://apt.opensips.org noble 3.4-releases" \
     > /etc/apt/sources.list.d/opensips.list
 
-# Install OpenSIPS with TLS + NAT + REST modules
-# List available packages first for debugging, then install
+# Install OpenSIPS with TLS + NAT + REST + STIR/SHAKEN modules
+# Note: nathelper is included in the core opensips package
 RUN apt-get update \
-    && apt-cache search opensips | sort \
     && apt-get install -y --no-install-recommends \
        opensips \
        opensips-tls-module \
        opensips-tls-openssl-module \
        opensips-tlsmgm-module \
-       opensips-nathelper-module \
        opensips-restclient-module \
+       opensips-stir-shaken-module \
     && rm -rf /var/lib/apt/lists/*
 
 # Save the original TransNexus config as reference
