@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  opensips:
+    build: .
+    container_name: opensips-clearip
+    restart: unless-stopped
+    network_mode: host               # Required — sees host NICs directly
+    environment:
+      # ── REQUIRED: Set these to your actual IPs ──
+      - INTERNAL_IP=10.0.1.100       # LAN-facing IP (PBX / phones)
+      - EXTERNAL_IP=203.0.113.50     # WAN-facing IP (SIP trunks)
+
+      # ── OPTIONAL: Defaults shown ──
+      - INTERNAL_PORT=5060
+      - EXTERNAL_PORT=5060
+      - EXTERNAL_TLS_PORT=5061
+      - SHM_MEMORY=1024
+      - PKG_MEMORY=4
+      - TLS_CN=localhost
+      - CLEARIP_URL=https://api.clearip.com
+    volumes:
+      # Persist TLS certs across container rebuilds
+      - tls-certs:/etc/opensips/tls
+      # Mount custom config (uncomment to override template)
+      # - ./opensips.cfg:/etc/opensips/opensips.cfg:ro
+
+volumes:
+  tls-certs:

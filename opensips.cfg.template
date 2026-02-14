@@ -1,0 +1,246 @@
+##
+## OpenSIPS 3.4 — Dual-Interface Inline SIP Proxy
+## LAN (PBX/phones) <-> OpenSIPS <-> WAN (SIP trunks / ITSP)
+##
+## Variables injected by entrypoint.sh via envsubst:
+##   ${INTERNAL_IP}, ${INTERNAL_PORT}
+##   ${EXTERNAL_IP}, ${EXTERNAL_PORT}, ${EXTERNAL_TLS_PORT}
+##   ${CLEARIP_URL}
+##
+
+# ───────────────────────────────────────────────────────────────
+# Global settings
+# ───────────────────────────────────────────────────────────────
+log_level = 3
+stderror_enabled = yes
+syslog_enabled = yes
+syslog_facility = LOG_LOCAL0
+
+auto_aliases = no
+dns = no
+rev_dns = no
+
+# ───────────────────────────────────────────────────────────────
+# Listen directives — dual interface
+# ───────────────────────────────────────────────────────────────
+
+# LAN side — PBX and phones
+listen = udp:${INTERNAL_IP}:${INTERNAL_PORT}   as lan
+listen = tcp:${INTERNAL_IP}:${INTERNAL_PORT}   as lan
+
+# WAN side — SIP trunks / ITSP
+listen = udp:${EXTERNAL_IP}:${EXTERNAL_PORT}   as wan
+listen = tcp:${EXTERNAL_IP}:${EXTERNAL_PORT}   as wan
+listen = tls:${EXTERNAL_IP}:${EXTERNAL_TLS_PORT} as wan
+
+# ───────────────────────────────────────────────────────────────
+# Modules
+# ───────────────────────────────────────────────────────────────
+loadmodule "signaling.so"
+loadmodule "sl.so"
+loadmodule "tm.so"
+loadmodule "rr.so"
+loadmodule "maxfwd.so"
+loadmodule "textops.so"
+loadmodule "sipmsgops.so"
+loadmodule "uri.so"
+loadmodule "nathelper.so"
+loadmodule "tls_openssl.so"
+loadmodule "tls_mgm.so"
+loadmodule "rest_client.so"
+loadmodule "proto_udp.so"
+loadmodule "proto_tcp.so"
+loadmodule "proto_tls.so"
+
+# ───────────────────────────────────────────────────────────────
+# Module parameters
+# ───────────────────────────────────────────────────────────────
+
+# -- Transaction Module --
+modparam("tm", "fr_timeout", 5)
+modparam("tm", "fr_inv_timeout", 30)
+
+# -- Record-Route --
+modparam("rr", "enable_full_lr", 1)
+modparam("rr", "append_fromtag", 1)
+
+# -- NAT Helper --
+modparam("nathelper", "natping_interval", 30)
+modparam("nathelper", "received_avp", "$avp(received)")
+
+# -- TLS --
+modparam("tls_mgm", "server_domain", "default")
+modparam("tls_mgm", "match", "[default]*")
+modparam("tls_mgm", "certificate", "[default]/etc/opensips/tls/cert.pem")
+modparam("tls_mgm", "private_key", "[default]/etc/opensips/tls/ckey.pem")
+modparam("tls_mgm", "verify_cert",  "[default]0")
+modparam("tls_mgm", "require_cert", "[default]0")
+
+# -- REST Client (for ClearIP API calls) --
+modparam("rest_client", "connection_timeout", 5)
+modparam("rest_client", "curl_timeout", 10)
+
+# ───────────────────────────────────────────────────────────────
+# Routing Logic
+# ───────────────────────────────────────────────────────────────
+
+route {
+    # ── Initial sanity checks ──
+    if (!mf_process_maxfwd_header(10)) {
+        sl_send_reply(483, "Too Many Hops");
+        exit;
+    }
+
+    # ── Determine which interface the request arrived on ──
+    if (is_myself("$si")) {
+        # Shouldn't happen — skip
+    }
+
+    # Tag the source interface
+    if ($socket_in(name) == "lan") {
+        $avp(source) = "lan";
+        xlog("L_INFO", "[$ci] Inbound from LAN ($si:$sp) — $rm $ru\n");
+    } else {
+        $avp(source) = "wan";
+        xlog("L_INFO", "[$ci] Inbound from WAN ($si:$sp) — $rm $ru\n");
+    }
+
+    # ── Sequential request inside a dialog ──
+    if (has_totag()) {
+        if (loose_route()) {
+            # NAT fix for replies going back to WAN
+            if ($avp(source) == "wan") {
+                fix_nated_contact();
+            }
+            t_relay();
+            exit;
+        } else {
+            sl_send_reply(404, "Not here");
+            exit;
+        }
+    }
+
+    # ── Cancel handling ──
+    if (is_method("CANCEL")) {
+        if (t_check_trans()) {
+            t_relay();
+        }
+        exit;
+    }
+
+    # ── Record-route so mid-dialog requests traverse us ──
+    if (is_method("INVITE|SUBSCRIBE")) {
+        record_route();
+    }
+
+    # ── NAT detection for WAN-side traffic ──
+    if ($avp(source) == "wan") {
+        if (nat_uac_test(19)) {
+            fix_nated_contact();
+            force_rport();
+            setflag(6);   # NAT flag
+        }
+    }
+
+    # ═══════════════════════════════════════════════════════════
+    # ROUTING DECISION — based on source interface
+    # ═══════════════════════════════════════════════════════════
+
+    if ($avp(source) == "lan") {
+        # ── LAN -> WAN (outbound call from PBX to trunk) ──
+        route(TO_WAN);
+    } else {
+        # ── WAN -> LAN (inbound call from trunk to PBX) ──
+        route(TO_LAN);
+    }
+}
+
+
+# ───────────────────────────────────────────────────────────────
+# Route: LAN -> WAN (outbound calls)
+# ───────────────────────────────────────────────────────────────
+route[TO_WAN] {
+    xlog("L_INFO", "[$ci] Routing LAN->WAN: $fu -> $ru\n");
+
+    # ── ClearIP: Sign outbound calls (STIR/SHAKEN) ──
+    # Uncomment and configure per TransNexus ClearIP documentation:
+    # route(CLEARIP_SIGN);
+
+    # Force outbound via WAN interface
+    $du = "sip:${EXTERNAL_IP}:${EXTERNAL_PORT}";
+    $fs = "udp:${EXTERNAL_IP}:${EXTERNAL_PORT}";
+
+    # Relay to trunk — adjust $du to your ITSP/trunk IP as needed
+    # For production, replace the $du above with your trunk destination:
+    # $du = "sip:<TRUNK_IP>:<TRUNK_PORT>";
+
+    if (!t_relay()) {
+        sl_send_reply(500, "Relay Error");
+    }
+    exit;
+}
+
+
+# ───────────────────────────────────────────────────────────────
+# Route: WAN -> LAN (inbound calls)
+# ───────────────────────────────────────────────────────────────
+route[TO_LAN] {
+    xlog("L_INFO", "[$ci] Routing WAN->LAN: $fu -> $ru\n");
+
+    # ── ClearIP: Verify inbound calls (STIR/SHAKEN) ──
+    # Uncomment and configure per TransNexus ClearIP documentation:
+    # route(CLEARIP_VERIFY);
+
+    # Force inbound to LAN interface toward PBX
+    $fs = "udp:${INTERNAL_IP}:${INTERNAL_PORT}";
+
+    # Route to your PBX — set this to your PBX IP:
+    # $du = "sip:<PBX_IP>:5060";
+
+    if (!t_relay()) {
+        sl_send_reply(500, "Relay Error");
+    }
+    exit;
+}
+
+
+# ───────────────────────────────────────────────────────────────
+# Route: ClearIP STIR/SHAKEN Signing (outbound)
+# ───────────────────────────────────────────────────────────────
+route[CLEARIP_SIGN] {
+    xlog("L_INFO", "[$ci] ClearIP: Signing call $fu -> $tu\n");
+
+    $var(clearip_req) = '{"from":"' + $fU + '","to":"' + $tU + '"}';
+
+    if (rest_post("${CLEARIP_URL}/sign", "$var(clearip_req)", "application/json", "$var(body)", "$var(ct)", "$var(rcode)")) {
+        if ($var(rcode) == 200) {
+            xlog("L_INFO", "[$ci] ClearIP: Signed successfully\n");
+            # Append Identity header from ClearIP response
+            # append_hf("Identity: $var(identity)\r\n");
+        } else {
+            xlog("L_WARN", "[$ci] ClearIP: Sign returned $var(rcode)\n");
+        }
+    } else {
+        xlog("L_ERR", "[$ci] ClearIP: Sign request failed\n");
+    }
+}
+
+
+# ───────────────────────────────────────────────────────────────
+# Route: ClearIP STIR/SHAKEN Verification (inbound)
+# ───────────────────────────────────────────────────────────────
+route[CLEARIP_VERIFY] {
+    xlog("L_INFO", "[$ci] ClearIP: Verifying call $fu -> $tu\n");
+
+    $var(clearip_req) = '{"from":"' + $fU + '","to":"' + $tU + '"}';
+
+    if (rest_post("${CLEARIP_URL}/verify", "$var(clearip_req)", "application/json", "$var(body)", "$var(ct)", "$var(rcode)")) {
+        if ($var(rcode) == 200) {
+            xlog("L_INFO", "[$ci] ClearIP: Verification passed\n");
+        } else {
+            xlog("L_WARN", "[$ci] ClearIP: Verification returned $var(rcode)\n");
+        }
+    } else {
+        xlog("L_ERR", "[$ci] ClearIP: Verify request failed\n");
+    }
+}
